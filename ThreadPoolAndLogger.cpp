@@ -33,12 +33,12 @@ private:
 
 ThreadPool::ThreadPool(size_t numThreads) {
 	for (size_t i = 0; i < numThreads; i++) {
-		workers.emplace_back(worker, this);
+		workers.emplace_back([this] {this->worker(); });
 	}
 }
 
 ThreadPool::~ThreadPool() {
-	stop = true;
+	stop.store(true);
 	condition.notify_all();
 	for (std::thread& worker : workers) {
 		if (worker.joinable()) worker.join();
@@ -63,12 +63,12 @@ void ThreadPool::worker() {
 
 template<class F,class... Args>
 void ThreadPool::enqueue(F&& f, Args&&... args) {
-	auto task = std::make_shared(std::function<void()>)(
-		std::bind(std::forward<F>(f), forward<Args>...(args));
+	auto task = std::make_shared<std::function<void()>>(
+		std::bind(std::forward<F>(f), std::forward<Args>(args)...)
 		);
 
 	{
-		std::lock_guard(std::mutex) lock(queueMutex);
+		std::lock_guard<std::mutex> lock(queueMutex);
 		tasks.emplace([task]() {(*task)(); });
 
 	}
@@ -112,20 +112,29 @@ private:
 	}
 
 	~Logger() {
+		isRunning = false;
 		stop();
 	}
 
+
 	void processLog() {
-		while (isRunning || logQueue.empty()) {
+		while (true) {
 			std::unique_lock<std::mutex> lock(logMutex);
-			condition.wait(lock, [this]() {return isRunning || !logQueue.empty(); });
+			condition.wait(lock, [this]() { return !isRunning || !logQueue.empty(); });
 
 			while (!logQueue.empty()) {
-				logFile_ << logQueue.front();
-				logQueue.pop();
+				if (logFile_.is_open()) {
+					logFile_ << logQueue.front();
+					logQueue.pop();
+				}
+				else {
+					std::cerr << "Log file is not open!" << std::endl;
+					return;
+				}
 			}
 			logFile_.flush();
 
+			if (!isRunning && logQueue.empty()) return;
 		}
 	}
 	std::string getTimestamp() {
@@ -133,7 +142,6 @@ private:
 		auto timeT = std::chrono::system_clock::to_time_t(now);
 		std::tm tmStruct{};
 
-		// Handle platform differences
 		#ifdef _WIN32
 			localtime_s(&tmStruct, &timeT); // Windows safe version
 		#else
@@ -156,6 +164,10 @@ private:
 	}
 
 	void stop() {
+		{
+			std::lock_guard<std::mutex> lock(logMutex);
+			isRunning = false;
+		}
 		condition.notify_all();
 		if (logger.joinable()) {
 			logger.join();
@@ -164,7 +176,44 @@ private:
 
 };
 
-void logging(Logger::LogLevel level,std::string log) {
-	
+void logging(std::thread::id id, Logger::LogLevel level, const std::string& log) {
+	Logger::getInstance().log(level, " Thread " + std::to_string(reinterpret_cast<std::uintptr_t>(&id)) + " " + log);
+	std::this_thread::sleep_for(std::chrono::microseconds(100));
+}
+
+
+void add(int x, int y) {
+	std::cout << "Adding operation: "<<x+y << std::endl;
+	logging(std::this_thread::get_id(), Logger::LogLevel::INFO, "Adding");
+
+}
+
+void sub(int x, int y) {
+	std::cout << "Subtracting operation" << x + y << std::endl;
+	logging(std::this_thread::get_id(), Logger::LogLevel::INFO, "Adding");
+}
+
+void multi(int x, int y) {
+	std::cout << "Multiplication operation" << x + y << std::endl;
+
+}
+
+
+int main() {
+	ThreadPool pool(3);
+
+	for (int i = 0; i < 30; i++) {
+		if (i % 3 == 0) {
+			pool.enqueue(multi,1,2);
+		}
+		else if (i % 2 == 0) {
+			pool.enqueue(sub,1,2);
+		}
+		else {
+			pool.enqueue(add,1,2);
+		}
+	}
+
+	return 0;
 }
 
